@@ -121,8 +121,9 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
   <div class="start">
     <button class="primary" id="go">Start listening</button>
     <button class="ghost" id="refBtn" aria-pressed="true">Reference tone on</button>
+    <button class="ghost" id="outBtn" aria-pressed="false">Output: Headphones</button>
   </div>
-  <p class="note-text"><strong>Wear headphones.</strong> Through speakers the microphone hears the reference tone and can lock onto it. If you must use speakers, tick “Using speakers” below.</p>
+  <p class="note-text" id="outNote"></p>
 
   <section class="panel controls">
     <div class="field">
@@ -170,7 +171,6 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
         <option value="flat">Flats (D♭)</option>
       </select>
     </div>
-    <label class="check" for="aec"><input type="checkbox" id="aec"><span>Using speakers (turns on echo cancellation; restarts the mic)</span></label>
   </section>
 </div>
 
@@ -181,12 +181,13 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
   const FLAT  = ['C','D♭','D','E♭','E','F','G♭','G','A♭','A','B♭','B'];
 
   // Audio and tracking state (declared first so the controls can reference it safely)
-  let ac, stream, src, analyser, buf, osc, toneGain, lp, running = false, raf, wake, cmnd;
-  const waves = {};
+  let ac, stream, src, analyser, buf, osc, toneGain, lp, comp, boost, running = false, raf, wake, cmnd;
+  const waves = {}, brightWaves = {};
   let cur = null, pending = null, pendN = 0, lastHeard = 0, shownCents = 0, lastMidiF = null;
 
-  const S = { vol:.35, timbre:'soft', octave:0, a4:440, gate:-48, tol:5, rel:.2, names:'sharp', aec:false, ref:true };
+  const S = { vol:.35, timbre:'soft', octave:0, a4:440, gate:-48, tol:5, rel:.2, names:'sharp', speaker:false, ref:true };
   try { Object.assign(S, JSON.parse(localStorage.getItem('shadowTuner') || '{}')); } catch (e) {}
+  if (S.aec) { S.speaker = true; delete S.aec; }
   const save = () => { try { localStorage.setItem('shadowTuner', JSON.stringify(S)); } catch (e) {} };
 
   // ---------- controls ----------
@@ -204,8 +205,19 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
   bind('tol', 'tol', v => '±' + v + '¢');
   bind('rel', 'rel', v => v.toFixed(2) + ' s');
   bind('names', 'names', null, String);
-  $('aec').checked = S.aec;
-  $('aec').addEventListener('change', async () => { S.aec = $('aec').checked; save(); if (running) { await stop(); start(); } });
+  const outBtn = $('outBtn');
+  const showOut = () => {
+    outBtn.setAttribute('aria-pressed', S.speaker);
+    outBtn.textContent = S.speaker ? 'Output: Speaker (boosted)' : 'Output: Headphones';
+    $('outNote').innerHTML = S.speaker
+      ? '<strong>Speaker mode.</strong> The tone is boosted, compressed and brightened so it carries on a phone speaker, and echo cancellation stops the mic from hearing it. Turn your phone volume all the way up. For low instruments, set Tone octave to “One above”: phone speakers can’t play low notes well.'
+      : '<strong>Wear headphones.</strong> Without echo cancellation the microphone can hear the reference tone and lock onto it. Switch Output to Speaker to play through the phone.';
+  };
+  outBtn.addEventListener('click', async () => {
+    S.speaker = !S.speaker; save(); showOut();
+    if (running) { await stop(); start(); }
+  });
+  showOut();
   const refBtn = $('refBtn');
   const showRef = () => { refBtn.setAttribute('aria-pressed', S.ref); refBtn.textContent = S.ref ? 'Reference tone on' : 'Reference tone off'; };
   refBtn.addEventListener('click', () => { S.ref = !S.ref; save(); showRef(); applyTone(); });
@@ -220,9 +232,16 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
       reed:   [0, 1, .05, .45, .04, .28, .03, .18, .02, .1],
       string: [0, 1, .5, .33, .25, .2, .16, .14, .12, .1],
     };
+    // Bright variants for small speakers: lift harmonics 2–6 so the pitch is heard
+    // even when the speaker can't reproduce the fundamental.
+    const lift = [0, 1, .6, .5, .4, .3, .22];
     for (const k in spec) {
       const re = new Float32Array(spec[k].length), im = new Float32Array(spec[k]);
       waves[k] = ac.createPeriodicWave(re, im);
+      const n = Math.max(spec[k].length, lift.length);
+      const bi = new Float32Array(n);
+      for (let i = 0; i < n; i++) bi[i] = Math.max(spec[k][i] || 0, lift[i] || 0);
+      brightWaves[k] = ac.createPeriodicWave(new Float32Array(n), bi);
     }
   }
 
@@ -233,8 +252,9 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
     try {
       ac = ac || new (window.AudioContext || window.webkitAudioContext)({ latencyHint: 'interactive' });
       await ac.resume();
+      try { if (navigator.audioSession) navigator.audioSession.type = 'play-and-record'; } catch (e) {}
       stream = await navigator.mediaDevices.getUserMedia({ audio: {
-        echoCancellation: S.aec, noiseSuppression: false, autoGainControl: false } });
+        echoCancellation: S.speaker, noiseSuppression: false, autoGainControl: false } });
     } catch (e) {
       setStatus('Mic blocked', 'err'); return;
     }
@@ -247,10 +267,13 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
     cmnd = new Float32Array(analyser.fftSize);
 
     osc = ac.createOscillator();
-    osc.setPeriodicWave(waves[S.timbre] || waves.soft);
-    lp = ac.createBiquadFilter(); lp.type = 'lowpass'; lp.frequency.value = 4000;
+    lp = ac.createBiquadFilter(); lp.type = 'lowpass';
     toneGain = ac.createGain(); toneGain.gain.value = 0;
-    osc.connect(lp).connect(toneGain).connect(ac.destination);
+    comp = ac.createDynamicsCompressor();
+    comp.knee.value = 6; comp.attack.value = .003; comp.release.value = .12;
+    boost = ac.createGain();
+    osc.connect(lp).connect(toneGain).connect(comp).connect(boost).connect(ac.destination);
+    setOutputChain();
     osc.start();
 
     running = true;
@@ -317,9 +340,23 @@ select, input[type=number] { font: 14px var(--body); padding: 8px 10px; border-r
   const etFreq = m => S.a4 * Math.pow(2, (m - 69) / 12);
   const name = m => (S.names === 'flat' ? FLAT : SHARP)[((m % 12) + 12) % 12];
 
+  function setOutputChain() {
+    if (!comp) return;
+    if (S.speaker) {
+      // Compress hard, then add make-up gain: louder without clipping.
+      comp.threshold.value = -24; comp.ratio.value = 12;
+      boost.gain.value = 3.2; lp.frequency.value = 9000;
+    } else {
+      comp.threshold.value = -1; comp.ratio.value = 4;
+      boost.gain.value = 1; lp.frequency.value = 4000;
+    }
+  }
+
   function applyTone() {
     if (!ac || !osc) return;
-    osc.setPeriodicWave(waves[S.timbre] || waves.soft);
+    const set = S.speaker ? brightWaves : waves;
+    const w = set[S.timbre] || set.soft;
+    if (osc._wave !== w) { osc.setPeriodicWave(w); osc._wave = w; }
     const t = ac.currentTime;
     if (cur !== null && S.ref && running) {
       osc.frequency.setTargetAtTime(etFreq(cur) * Math.pow(2, S.octave), t, .004);
